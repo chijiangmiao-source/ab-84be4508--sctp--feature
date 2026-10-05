@@ -16,6 +16,9 @@
   label { display: block; font-size: 12px; color: #8b949e; margin: 10px 0 4px; }
   input[type=text] { width: 320px; padding: 7px 9px; background: #0d1117; color: #c9d1d9;
                      border: 1px solid #30363d; border-radius: 6px; font: inherit; }
+  select { width: 320px; padding: 7px 9px; background: #0d1117; color: #c9d1d9;
+           border: 1px solid #30363d; border-radius: 6px; font: inherit; }
+  input.num { width: 110px; }
   textarea { width: 100%; min-height: 130px; padding: 8px; background: #010409; color: #a5d6ff;
              border: 1px solid #30363d; border-radius: 6px; font: 12px/1.5 ui-monospace, monospace; }
   button { margin: 10px 8px 0 0; padding: 7px 16px; border: 1px solid #30363d; border-radius: 6px;
@@ -78,6 +81,18 @@
     <section>
       <h2>已交付消息</h2>
       <div id="messages"></div>
+    </section>
+    <section>
+      <h2>消息来源查询</h2>
+      <label for="msgSel">已交付消息</label>
+      <select id="msgSel"></select>
+      <label for="msgOffset">消息内起始字节(从 0 起)</label>
+      <input type="text" class="num" id="msgOffset" placeholder="0">
+      <label for="msgLength">长度(字节)</label>
+      <input type="text" class="num" id="msgLength" placeholder="1">
+      <br>
+      <button id="sourceBtn">查询来源</button>
+      <div id="sourceResult" style="margin-top:10px"></div>
     </section>
     <section>
       <h2>逐包裁决(冻结)</h2>
@@ -144,6 +159,11 @@ function render(view) {
         `<tr><td>${m.seq}</td><td>${m.ssn}</td><td>${m.tsns.join(", ")}</td><td>${m.length}</td>` +
         `<td class="hex">${esc(m.hex)}</td></tr>`).join("") + `</table>`;
 
+  $("msgSel").innerHTML = view.messages.map(m =>
+    `<option value="${m.ssn}">消息 #${m.seq} · 流序 ${m.ssn} · 长度 ${m.length}</option>`).join("");
+  $("sourceResult").innerHTML = view.messages.length === 0
+    ? '<p class="muted">(无已交付消息可查询)</p>' : "";
+
   $("verdicts").innerHTML =
     `<table><tr><th>#</th><th>类型</th><th>裁决</th><th>说明 / 依据</th><th>TSN</th><th>流序</th>` +
     `<th>处理后累计 TSN</th><th>缓存 +</th><th>缓存 −</th><th>跳过 +</th></tr>` +
@@ -185,6 +205,31 @@ $("loadBtn").onclick = async () => {
   if (status !== 200) { showError(body.error || `请求失败: ${status}`); return; }
   render(body);
   $("hint").textContent = `已重新打开审计 ${id}: 逐包裁决与消息列表与首次一致`;
+};
+
+$("sourceBtn").onclick = async () => {
+  showError("");
+  const id = $("auditId").value.trim();
+  if (!id) { showError("请填写稳定审计标识"); return; }
+  const ssn = $("msgSel").value;
+  if (!ssn) { showError("没有可查询的已交付消息"); return; }
+  const offset = $("msgOffset").value.trim();
+  const length = $("msgLength").value.trim();
+  const { status, body } = await api(`/api/audits/${encodeURIComponent(id)}/messages/${ssn}/source` +
+    `?offset=${encodeURIComponent(offset)}&length=${encodeURIComponent(length)}`);
+  if (status !== 200) {
+    $("sourceResult").innerHTML = "";
+    showError(body.error || `来源查询失败: ${status}`);
+    return;
+  }
+  $("sourceResult").innerHTML =
+    `<p class="muted">消息 #${body.messageSeq} · 流序 ${body.ssn} · 消息长度 ${body.messageLength} · ` +
+    `查询区间 [${body.offset}, ${body.offset + body.length})</p>` +
+    `<table><tr><th>消息内区间 [起, 止)</th><th>TSN</th><th>首次接收包序号</th>` +
+    `<th>原始包内用户载荷区间 [起, 止)</th></tr>` +
+    body.segments.map(g =>
+      `<tr><td>[${g.msgStart}, ${g.msgEnd})</td><td>${g.tsn}</td><td>${g.packetIndex}</td>` +
+      `<td>[${g.packetStart}, ${g.packetEnd})</td></tr>`).join("") + `</table>`;
 };
 
 $("submitBtn").onclick = async () => {

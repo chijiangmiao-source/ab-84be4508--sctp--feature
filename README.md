@@ -11,6 +11,7 @@
 - **缓存分片**(TSN / 流序 / B/E 标志 / 长度)及**每包缓存变化**(+/−)
 - **跳过范围**(被合法 FORWARD-TSN 跨越的 TSN 区间)
 - **已交付消息**(流序、来源 TSN、长度、内容十六进制)
+- **已交付消息的字节来源**(消息内半开区间、TSN、首次接收包序号、原始包内用户载荷半开区间)
 
 ## 裁决规则
 
@@ -61,6 +62,7 @@ docker compose down -v          # 清理
 | `GET` | `/health` | 健康响应 `{"status":"ok"}` |
 | `GET` | `/api/audits/{id}` | 按标识重新打开: 逐包裁决 + 状态 + 消息列表 |
 | `POST` | `/api/audits/{id}/packets` | 提交 `{"packets":["<base64>", ...]}`, 至多 32 个 |
+| `GET` | `/api/audits/{id}/messages/{ssn}/source?offset=N&length=M` | 已交付消息一段字节的原始捕获来源 |
 
 示例(乱序互补的两个分片, 交付一条 `HELLO-WORLD!`):
 
@@ -75,6 +77,27 @@ curl http://localhost:8080/api/audits/pass-001
 ```
 
 审计标识: 1–64 位字母、数字、`-`、`_`。
+
+## 消息来源定位
+
+审查员重新打开已冻结的审计后, 可在操作页选择一条已交付消息、输入消息内的起始字节与长度,
+定位该段控制载荷究竟来自哪些原始捕获包; 接口为
+`GET /api/audits/{id}/messages/{ssn}/source?offset=N&length=M`。
+
+- 结果按消息字节顺序切开, 恰好覆盖 `[offset, offset+length)`, 无重叠、无空洞
+- 每段给出: 消息内半开区间 `[msgStart,msgEnd)`、来源 `tsn`、该 TSN **首次接收的包序号**
+  `packetIndex`, 以及 DATA 用户载荷在该原始 SCTP 包中的半开字节区间 `[packetStart,packetEnd)`
+- 同一 TSN 字节完全相同的重传不生成第二条来源(一律指向首次接收的包)
+- 已被跳过或从未完整交付的流序不可作为查询对象(`404`); 超出消息长度、非正长度等
+  参数错误返回 `400` 并给出明确原因
+- 查询只读: 逐包裁决、缓存变化、已交付列表及重开后的内容均不受影响
+
+示例(沿用上文 `pass-001`, 查询跨两个分片的 `[4,10)`):
+
+```bash
+curl "http://localhost:8080/api/audits/pass-001/messages/10/source?offset=4&length=6"
+# segments: [4,6)→TSN 1000/包1/[32,34)   [6,10)→TSN 1001/包0/[28,32)
+```
 
 ## 环境变量
 
@@ -97,7 +120,7 @@ go run ./cmd/smoke -addr http://localhost:8080  # 对运行中的服务做冒烟
 
 ```
 sctp/     SCTP 公共头 + CRC32C 校验、DATA / FORWARD-TSN 解析与构造
-audit/    逐包裁决引擎、冻结存储、HTTP API、操作页
+audit/    逐包裁决引擎、冻结存储、HTTP API、操作页、已交付消息来源定位
 cmd/server  服务入口
 cmd/smoke   验收场景冒烟工具
 scripts/verify.sh  verify 容器的一次性验证脚本

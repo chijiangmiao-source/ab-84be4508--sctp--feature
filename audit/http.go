@@ -4,8 +4,10 @@ import (
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -27,6 +29,8 @@ type apiError struct {
 //	GET  /health                  健康响应
 //	GET  /api/audits/{id}         按标识重新打开冻结的逐包裁决与消息列表
 //	POST /api/audits/{id}/packets 按捕获顺序提交至多 32 个 Base64 包
+//	GET  /api/audits/{id}/messages/{ssn}/source?offset=N&length=M
+//	                              已交付消息 [offset,offset+length) 字节的原始捕获来源
 func NewHandler(st *Store) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
@@ -52,6 +56,47 @@ func NewHandler(st *Store) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, s.View())
+	})
+	mux.HandleFunc("GET /api/audits/{id}/messages/{ssn}/source", func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if !ValidID(id) {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: "审计标识非法: 仅允许 1-64 位字母数字、'-'、'_'"})
+			return
+		}
+		ssn64, err := strconv.ParseUint(r.PathValue("ssn"), 10, 16)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: fmt.Sprintf("流序非法: %q", r.PathValue("ssn"))})
+			return
+		}
+		offset, err := strconv.Atoi(r.URL.Query().Get("offset"))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: "参数 offset 缺失或不是整数"})
+			return
+		}
+		length, err := strconv.Atoi(r.URL.Query().Get("length"))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: "参数 length 缺失或不是整数"})
+			return
+		}
+		s, ok, err := st.Get(id)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
+			return
+		}
+		if !ok {
+			writeJSON(w, http.StatusNotFound, apiError{Error: fmt.Sprintf("审计 %s 不存在", id)})
+			return
+		}
+		src, err := s.MessageSource(uint16(ssn64), offset, length)
+		if err != nil {
+			if errors.Is(err, ErrMessageNotFound) {
+				writeJSON(w, http.StatusNotFound, apiError{Error: err.Error()})
+			} else {
+				writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, src)
 	})
 	mux.HandleFunc("POST /api/audits/{id}/packets", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")

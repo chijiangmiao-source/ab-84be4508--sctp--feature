@@ -117,6 +117,8 @@ func main() {
 	check(status == 200 && health.Status == "ok", "GET /health 返回 200 且 status ok (实际 %d %s)", status, bytes.TrimSpace(body))
 	status, body = get("/")
 	check(status == 200 && bytes.Contains(body, []byte("审计")), "GET / 返回操作页 (实际 %d)", status)
+	check(bytes.Contains(body, []byte("消息来源查询")) && bytes.Contains(body, []byte("/source")),
+		"操作页包含消息来源查询入口(选择消息、起始字节、长度)")
 	status, _ = get("/api/audits/unknown-" + suffix)
 	check(status == 404, "未知审计标识返回 404 (实际 %d)", status)
 
@@ -225,6 +227,50 @@ func main() {
 	check(status == 400, "超过 32 个包返回 400 (实际 %d)", status)
 	status, _, body = postRaw(idC, `{"packets":["!!!not-base64!!!"]}`)
 	check(status == 400, "非法 Base64 返回 400 (实际 %d)", status)
+
+	fmt.Println("== 场景 D: 已交付消息的字节来源定位(跨两个分片) ==")
+	// 审计 A 的消息 "HELLO-WORLD!"(流序 10)由 TSN 1000(首次于包1)与 TSN 1001(首次于包0)组成;
+	// 包2 是 TSN 1000 字节完全相同的重传, 不得生成第二条来源。
+	status, body = get("/api/audits/" + idA + "/messages/10/source?offset=4&length=6")
+	var src audit.SourceView
+	_ = json.Unmarshal(body, &src)
+	check(status == 200, "跨分片来源查询返回 200 (实际 %d %s)", status, bytes.TrimSpace(body))
+	wantSegs := []audit.SourceSegment{
+		{MsgStart: 4, MsgEnd: 6, TSN: 1000, PacketIndex: 1, PacketStart: 32, PacketEnd: 34},
+		{MsgStart: 6, MsgEnd: 10, TSN: 1001, PacketIndex: 0, PacketStart: 28, PacketEnd: 32},
+	}
+	gotSegs, _ := json.Marshal(src.Segments)
+	wantSegsJSON, _ := json.Marshal(wantSegs)
+	check(string(gotSegs) == string(wantSegsJSON),
+		"跨两个分片的来源按消息字节顺序切开且无重叠无空洞: [4,6)→TSN1000/包1/[32,34), [6,10)→TSN1001/包0/[28,32) (实际 %s)", gotSegs)
+	check(src.MessageLength == 12 && src.SSN == 10 && src.MessageSeq == 0,
+		"来源视图元信息: 流序 10, 消息长度 12 (实际 %+v)", src)
+
+	status, body = get("/api/audits/" + idA + "/messages/10/source?offset=0&length=12")
+	var full audit.SourceView
+	_ = json.Unmarshal(body, &full)
+	check(status == 200 && len(full.Segments) == 2,
+		"整条消息来源恰为 2 段: 字节完全相同的重传(包2)不生成第二条来源 (实际 %d 段)", len(full.Segments))
+	check(len(full.Segments) == 2 && full.Segments[0].PacketIndex == 1 && full.Segments[1].PacketIndex == 0 &&
+		full.Segments[0].MsgStart == 0 && full.Segments[0].MsgEnd == 6 &&
+		full.Segments[1].MsgStart == 6 && full.Segments[1].MsgEnd == 12,
+		"来源分段连续覆盖 [0,12): TSN 1000→首次包1, TSN 1001→首次包0 (实际 %+v)", full.Segments)
+
+	status, _ = get("/api/audits/" + idA + "/messages/10/source?offset=0&length=0")
+	check(status == 400, "非正长度返回 400 (实际 %d)", status)
+	status, _ = get("/api/audits/" + idA + "/messages/10/source?offset=12&length=1")
+	check(status == 400, "起始字节超出消息长度返回 400 (实际 %d)", status)
+	status, _ = get("/api/audits/" + idA + "/messages/10/source?offset=10&length=5")
+	check(status == 400, "区间超出消息长度返回 400 (实际 %d)", status)
+	status, _ = get("/api/audits/" + idA + "/messages/999/source?offset=0&length=1")
+	check(status == 404, "不存在的流序返回 404 (实际 %d)", status)
+	status, _ = get("/api/audits/" + idB + "/messages/20/source?offset=0&length=1")
+	check(status == 404, "已被跳过作废的流序不可作为查询对象, 返回 404 (实际 %d)", status)
+
+	// 回归: 来源查询为只读, 审计 A 的逐包裁决与消息列表仍与首次一致。
+	status, vaAfter := getView(idA)
+	check(status == 200 && frozenJSON(vaAfter) == frozenJSON(va6),
+		"来源查询后重读审计 A: 逐包裁决与消息列表仍与首次一致")
 
 	fmt.Println()
 	if failures > 0 {

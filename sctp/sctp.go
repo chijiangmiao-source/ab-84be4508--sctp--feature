@@ -73,6 +73,22 @@ type ForwardTSNChunk struct {
 	Pairs     []StreamPair
 }
 
+// DataPayloadRange 返回报文中 DATA 用户载荷的半开字节区间 [start, end)。
+// 报文须通过公共头与 CRC32C 校验且包含 DATA 块, 否则返回错误。
+func DataPayloadRange(raw []byte) (start, end int, err error) {
+	p, err := Parse(raw)
+	if err != nil {
+		return 0, 0, err
+	}
+	d, ok := p.Chunk.(*DataChunk)
+	if !ok {
+		return 0, 0, fmt.Errorf("报文不含 DATA 块, 无法定位用户载荷")
+	}
+	// 公共头(12) + 块头(4) + DATA 固定字段 TSN/流/流序/PPID(12)。
+	start = HeaderLen + 16
+	return start, start + len(d.Data), nil
+}
+
 // Parse 校验公共头与 CRC32C, 并解析唯一的 DATA 或 FORWARD-TSN 块。
 // 任何格式错误、校验失败或不支持的块类型都返回错误(由上层冻结拒绝)。
 func Parse(raw []byte) (*Packet, error) {
