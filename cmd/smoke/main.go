@@ -67,6 +67,14 @@ func getView(id string) (int, *audit.View) {
 	return status, v
 }
 
+// getSource 查询已交付消息内 [start, start+length) 的字节来源。
+func getSource(id string, ssn, start, length int) (int, *audit.MessageSourceView, []byte) {
+	status, body := get(fmt.Sprintf("/api/audits/%s/messages/%d/source?start=%d&length=%d", id, ssn, start, length))
+	v := &audit.MessageSourceView{}
+	_ = json.Unmarshal(body, v)
+	return status, v, body
+}
+
 // frozenJSON 提取逐包裁决与消息列表的 JSON, 用于一致性比较。
 func frozenJSON(v *audit.View) string {
 	data, _ := json.Marshal(struct {
@@ -117,6 +125,8 @@ func main() {
 	check(status == 200 && health.Status == "ok", "GET /health 返回 200 且 status ok (实际 %d %s)", status, bytes.TrimSpace(body))
 	status, body = get("/")
 	check(status == 200 && bytes.Contains(body, []byte("审计")), "GET / 返回操作页 (实际 %d)", status)
+	check(status == 200 && bytes.Contains(body, []byte("消息字节来源")) && bytes.Contains(body, []byte("/source?start=")),
+		"操作页包含字节来源查询入口")
 	status, _ = get("/api/audits/unknown-" + suffix)
 	check(status == 404, "未知审计标识返回 404 (实际 %d)", status)
 
@@ -202,6 +212,8 @@ func main() {
 		"补交旧片不改变结论: 仍无交付、缓存为空、跳过范围不变")
 	status, vbGet := getView(idB)
 	check(status == 200 && frozenJSON(vbGet) == frozenJSON(vb3), "重新读取审计 B: 裁决与消息列表一致")
+	status, _, _ = getSource(idB, 20, 0, 1)
+	check(status == 404, "被跳过且未完整交付的流序不可作为来源查询对象, 返回 404 (实际 %d)", status)
 
 	fmt.Println("== 场景 C: 提交冲突与参数校验 ==")
 	idC := "smoke-c-" + suffix
@@ -225,6 +237,49 @@ func main() {
 	check(status == 400, "超过 32 个包返回 400 (实际 %d)", status)
 	status, _, body = postRaw(idC, `{"packets":["!!!not-base64!!!"]}`)
 	check(status == 400, "非法 Base64 返回 400 (实际 %d)", status)
+
+	fmt.Println("== 场景 D: 已交付消息的字节来源定位(跨两个分片) ==")
+	idD := "smoke-d-" + suffix
+	h1 := data(6000, 60, false, true, false, "HELLO-")
+	h2 := data(6001, 60, false, false, true, "WORLD!")
+	status, vd, _ := post(idD, h2, h1) // 乱序: 尾片先到
+	check(status == 200 && len(vd.Messages) == 1 && vd.Messages[0].Hex == wantHex,
+		"乱序互补分片交付一条完整消息 (实际 %d/%d)", status, len(vd.Messages))
+	status, vd2, _ := post(idD, h2, h1, h1)
+	check(status == 200 && len(vd2.Verdicts) == 3 && vd2.Verdicts[2].Decision == "duplicate",
+		"完全相同重传判为 duplicate (实际 %v)", vd2.Verdicts[len(vd2.Verdicts)-1].Decision)
+
+	// 跨两个分片的查询 [4,10): "O-" 来自 TSN 6000(包1), "WORL" 来自 TSN 6001(包0)。
+	status, sv, _ := getSource(idD, 60, 4, 6)
+	segOK := status == 200 && sv.MessageLength == 12 && len(sv.Segments) == 2 &&
+		sv.Segments[0].MsgStart == 4 && sv.Segments[0].MsgEnd == 6 &&
+		sv.Segments[0].TSN == 6000 && sv.Segments[0].PacketIndex == 1 &&
+		sv.Segments[0].PacketStart == 32 && sv.Segments[0].PacketEnd == 34 &&
+		sv.Segments[1].MsgStart == 6 && sv.Segments[1].MsgEnd == 10 &&
+		sv.Segments[1].TSN == 6001 && sv.Segments[1].PacketIndex == 0 &&
+		sv.Segments[1].PacketStart == 28 && sv.Segments[1].PacketEnd == 32
+	check(segOK, "跨两个分片的来源: 消息内区间/TSN/首次包序号/包内区间正确 (实际 %d %+v)", status, sv.Segments)
+	if len(sv.Segments) == 2 {
+		check(sv.Segments[0].MsgEnd == sv.Segments[1].MsgStart,
+			"来源段按消息字节顺序切开, 无重叠无空洞")
+	}
+
+	// 整条消息: 完全相同重传(包2)不生成第二条来源, 包序号仍为首次接收。
+	status, svFull, _ := getSource(idD, 60, 0, 12)
+	check(status == 200 && len(svFull.Segments) == 2 &&
+		svFull.Segments[0].PacketIndex == 1 && svFull.Segments[1].PacketIndex == 0,
+		"整消息来源仅含首次接收包, 重传不生成第二条来源 (实际 %d %+v)", status, svFull.Segments)
+
+	status, _, _ = getSource(idD, 60, 0, 0)
+	check(status == 400, "非正长度返回 400 (实际 %d)", status)
+	status, _, _ = getSource(idD, 60, 12, 1)
+	check(status == 400, "超出消息长度返回 400 (实际 %d)", status)
+	status, _, _ = getSource(idD, 60, 11, 2)
+	check(status == 400, "区间越出消息末尾返回 400 (实际 %d)", status)
+	status, _, _ = getSource(idD, 61, 0, 1)
+	check(status == 404, "不存在的流序返回 404 (实际 %d)", status)
+	status, _, _ = getSource("unknown-"+suffix, 60, 0, 1)
+	check(status == 404, "未知审计标识的来源查询返回 404 (实际 %d)", status)
 
 	fmt.Println()
 	if failures > 0 {

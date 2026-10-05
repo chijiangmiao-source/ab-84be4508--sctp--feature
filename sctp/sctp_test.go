@@ -32,6 +32,10 @@ func TestParseDataRoundTrip(t *testing.T) {
 	if string(d.Data) != "ping" {
 		t.Fatalf("用户数据错误: %q", d.Data)
 	}
+	// 用户数据在原始报文中的半开区间可由 PayloadOffset 复算。
+	if d.PayloadOffset != 28 || string(raw[d.PayloadOffset:d.PayloadOffset+len(d.Data)]) != "ping" {
+		t.Fatalf("用户数据偏移错误: PayloadOffset=%d", d.PayloadOffset)
+	}
 	// 校验和字段以小端存放且与计算值一致。
 	if got := binary.LittleEndian.Uint32(raw[8:12]); got != Checksum(raw) {
 		t.Fatalf("校验和字段 %08x 与计算值不一致", got)

@@ -59,6 +59,10 @@ type DataChunk struct {
 	B      bool
 	E      bool
 	Data   []byte
+	// PayloadOffset 是用户数据在原始 SCTP 报文中的起始字节偏移:
+	// 公共头 12 + 块头 4 + DATA 固定字段 12 = 28。
+	// 用户数据在报文中占据半开区间 [PayloadOffset, PayloadOffset+len(Data))。
+	PayloadOffset int
 }
 
 // StreamPair 是 FORWARD-TSN 中的 (流标识, 流序号) 对。
@@ -113,6 +117,8 @@ func Parse(raw []byte) (*Packet, error) {
 			B:      flags&FlagB != 0,
 			E:      flags&FlagE != 0,
 			Data:   append([]byte(nil), body[12:]...),
+			// 用户数据起于公共头(12) + 块头(4) + DATA 固定字段(12)。
+			PayloadOffset: HeaderLen + 16,
 		}
 		p.Chunk = d
 	case ChunkForwardTSN:

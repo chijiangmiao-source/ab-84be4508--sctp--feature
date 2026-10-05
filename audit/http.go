@@ -4,8 +4,10 @@ import (
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -27,6 +29,9 @@ type apiError struct {
 //	GET  /health                  健康响应
 //	GET  /api/audits/{id}         按标识重新打开冻结的逐包裁决与消息列表
 //	POST /api/audits/{id}/packets 按捕获顺序提交至多 32 个 Base64 包
+//	GET  /api/audits/{id}/messages/{ssn}/source?start=&length=
+//	                              已交付消息内一段字节的来源定位(消息内区间 / TSN /
+//	                              首次接收包序号 / 原始包内区间, 均为半开区间)
 func NewHandler(st *Store) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
@@ -52,6 +57,47 @@ func NewHandler(st *Store) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, s.View())
+	})
+	mux.HandleFunc("GET /api/audits/{id}/messages/{ssn}/source", func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if !ValidID(id) {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: "审计标识非法: 仅允许 1-64 位字母数字、'-'、'_'"})
+			return
+		}
+		ssn64, err := strconv.ParseUint(r.PathValue("ssn"), 10, 16)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: fmt.Sprintf("流序非法: %q 不是 0-65535 的整数", r.PathValue("ssn"))})
+			return
+		}
+		start, err := queryInt(r, "start")
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
+			return
+		}
+		length, err := queryInt(r, "length")
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
+			return
+		}
+		s, ok, err := st.Get(id)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
+			return
+		}
+		if !ok {
+			writeJSON(w, http.StatusNotFound, apiError{Error: fmt.Sprintf("审计 %s 不存在", id)})
+			return
+		}
+		src, err := s.MessageSource(uint16(ssn64), start, length)
+		if err != nil {
+			if errors.Is(err, ErrMessageNotDelivered) {
+				writeJSON(w, http.StatusNotFound, apiError{Error: err.Error()})
+			} else {
+				writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, src)
 	})
 	mux.HandleFunc("POST /api/audits/{id}/packets", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
@@ -111,4 +157,17 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_, _ = w.Write(append(data, '\n'))
+}
+
+// queryInt 读取必需的整数查询参数。
+func queryInt(r *http.Request, name string) (int, error) {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return 0, fmt.Errorf("缺少查询参数 %s", name)
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("查询参数 %s 非法: %q 不是整数", name, raw)
+	}
+	return n, nil
 }
